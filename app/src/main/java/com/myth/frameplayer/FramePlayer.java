@@ -16,9 +16,13 @@
 
 package com.myth.frameplayer;
 
+import android.media.AudioFormat;
+import android.media.AudioManager;
+import android.media.AudioTrack;
 import android.media.MediaCodec;
 import android.media.MediaExtractor;
 import android.media.MediaFormat;
+import android.os.AsyncTask;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
@@ -33,6 +37,7 @@ import java.nio.ByteBuffer;
 import java.util.Timer;
 import java.util.TimerTask;
 
+import static android.media.MediaExtractor.SEEK_TO_PREVIOUS_SYNC;
 
 
 public class FramePlayer implements Runnable {
@@ -47,8 +52,10 @@ public class FramePlayer implements Runnable {
     private static final boolean VERBOSE = true;
 
     private MediaCodec.BufferInfo mBufferInfo = new MediaCodec.BufferInfo();
+    private ByteBuffer inputBuffer;
 
     final int TIMEOUT_USEC = 10000;
+    private AudioTrack audioTrack;
 
     public void setSourceFile(File sourceFile) {
         this.sourceFile = sourceFile;
@@ -59,9 +66,12 @@ public class FramePlayer implements Runnable {
     private int mVideoWidth;
     private int mVideoHeight;
 
+    private MediaExtractor mAudioExtractor;
     private MediaExtractor mMediaExtractor;
+    private MediaCodec mAudioCodec;
     private MediaCodec mMediaCodec;
     private int mTrackIndex;
+    private int mAudioTrackIndex;
     private Thread mThread;
     private LocalHandler mLocalHandler;
 
@@ -79,6 +89,7 @@ public class FramePlayer implements Runnable {
     }
 
     private int mFrameInterval;
+    private int videoFrameRate;
 
 
     public FramePlayer(Surface outputSurface) {
@@ -87,16 +98,23 @@ public class FramePlayer implements Runnable {
 
     private int frame;
     private Timer timer;
-
     private TimerTask timerTask;
 
     private long duration;
+    private boolean seekOffsetFlag = false;
+    private boolean isLoop = false;
+    private boolean hadPlay = false;
+    private int seekOffset = 0;
+    private boolean doStop = false;
+    private AudioPlayTask mAudioPlayTask;
+
+    private volatile boolean isRunning;
 
     public void nextFrame() {
         mLocalHandler.sendMessage(mLocalHandler.obtainMessage(MSG_PLAY_PROGRESS, frame++, 0));
     }
 
-    private class ProgressTimerTask extends TimerTask {
+    private class ProgressTimerTask extends java.util.TimerTask {
         @Override
         public void run() {
             if (isRunning) {
@@ -161,6 +179,9 @@ public class FramePlayer implements Runnable {
             timerTask = null;
             isRunning = false;
         }
+        doStop = true;
+        seekOffset = 0;
+        seekOffsetFlag = false;
     }
 
 
@@ -168,7 +189,6 @@ public class FramePlayer implements Runnable {
         return isRunning;
     }
 
-    private volatile boolean isRunning;
 
     public void pause() {
         if (isRunning) {
@@ -210,14 +230,58 @@ public class FramePlayer implements Runnable {
             if (mTrackIndex < 0) {
                 throw new RuntimeException("No video track found in " + sourceFile);
             }
-            mMediaExtractor.selectTrack(mTrackIndex);
-
             MediaFormat format = mMediaExtractor.getTrackFormat(mTrackIndex);
+            videoFrameRate = format.getInteger(MediaFormat.KEY_FRAME_RATE);
             if (mFrameInterval == 0) {
-                mFrameInterval = 1000 / format.getInteger(MediaFormat.KEY_FRAME_RATE);
+                mFrameInterval = 1000 / videoFrameRate;
             }
             String mime = format.getString(MediaFormat.KEY_MIME);
             duration = format.getLong(MediaFormat.KEY_DURATION);
+
+
+            mAudioExtractor = new MediaExtractor();
+            mAudioExtractor.setDataSource(sourceFile.toString());
+            mAudioTrackIndex = selectAudioTrack(mAudioExtractor);
+
+            //only support pcm
+            if (mAudioTrackIndex != -1) {
+                relaxResources(true);
+                MediaFormat audioFormat = mMediaExtractor.getTrackFormat(mAudioTrackIndex);
+                String audioMime = audioFormat.getString(MediaFormat.KEY_MIME);
+                try {
+                    // 实例化一个指定类型的解码器,提供数据输出
+                    mAudioCodec = MediaCodec.createDecoderByType(audioMime);
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
+
+                mAudioCodec.configure(audioFormat, null /* surface */, null /* crypto */, 0 /* flags */);
+                mAudioCodec.start();
+
+
+                int channels = audioFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT);
+                int sampleRate = (int) (1.0f * audioFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE) * (1000 / videoFrameRate) / mFrameInterval);
+                int channelConfiguration = channels == 1 ? AudioFormat.CHANNEL_OUT_MONO : AudioFormat.CHANNEL_OUT_STEREO;
+                audioTrack = new AudioTrack(
+                        AudioManager.STREAM_MUSIC,
+                        sampleRate,
+                        channelConfiguration,
+                        AudioFormat.ENCODING_PCM_16BIT,
+                        AudioTrack.getMinBufferSize(
+                                sampleRate,
+                                channelConfiguration,
+                                AudioFormat.ENCODING_PCM_16BIT
+                        ),
+                        AudioTrack.MODE_STREAM
+                );
+
+//开始play，等待write发出声音
+                audioTrack.play();
+                mAudioExtractor.selectTrack(mAudioTrackIndex);
+            }
+
+
+            mMediaExtractor.selectTrack(mTrackIndex);
             mMediaCodec = MediaCodec.createDecoderByType(mime);
             mMediaCodec.configure(format, mOutputSurface, null, 0);
             mMediaCodec.start();
@@ -225,11 +289,19 @@ public class FramePlayer implements Runnable {
             timer = new Timer();
             timerTask = new ProgressTimerTask();
             timer.schedule(timerTask, 0, mFrameInterval);
+
+            if (mAudioPlayTask != null) {
+                mAudioPlayTask.cancel(true);
+            }
+            mAudioPlayTask = new AudioPlayTask();
+            mAudioPlayTask.executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR);
+
         } catch (Exception e) {
             Log.e(TAG, e.toString());
             destroyExtractor();
         }
     }
+
 
     private void destroyExtractor() {
         if (mMediaCodec != null) {
@@ -242,6 +314,24 @@ public class FramePlayer implements Runnable {
             mMediaExtractor = null;
         }
     }
+
+    private void relaxResources(Boolean release) {
+        if (mAudioCodec != null) {
+            if (release) {
+                mAudioCodec.stop();
+                mAudioCodec.release();
+                mAudioCodec = null;
+            }
+
+        }
+        if (audioTrack != null) {
+            if (!doStop)
+                audioTrack.flush();
+            audioTrack.release();
+            audioTrack = null;
+        }
+    }
+
 
     /**
      * Selects the video track, if any.
@@ -265,18 +355,180 @@ public class FramePlayer implements Runnable {
         return -1;
     }
 
+    private int selectAudioTrack(MediaExtractor mMediaExtractor) {
+        for (int i = 0; i < mMediaExtractor.getTrackCount(); i++) {
+            MediaFormat format = mMediaExtractor.getTrackFormat(i);
+            if (format.getString(MediaFormat.KEY_MIME).startsWith("audio/")) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    private long curPosition;
+
+    private void doAudio() {
+
+        ByteBuffer[] codecInputBuffers;
+        ByteBuffer[] codecOutputBuffers;
+
+
+        MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
+
+        codecInputBuffers = mAudioCodec.getInputBuffers();
+        // 解码后的数据
+        codecOutputBuffers = mAudioCodec.getOutputBuffers();
+
+        // 解码
+        boolean sawInputEOS = false;
+        boolean sawOutputEOS = false;
+        int noOutputCounter = 0;
+        int noOutputCounterLimit = 50;
+
+        int inputBufIndex;
+        int bufIndexCheck = 0;
+        doStop = false;
+        while (!sawOutputEOS && noOutputCounter < noOutputCounterLimit && !doStop) {
+
+            if (!isRunning) {
+                try {
+                    //防止死循环ANR
+                    Thread.sleep(500);
+                } catch (InterruptedException e) {
+                    e.printStackTrace();
+                }
+                continue;
+            }
+
+            noOutputCounter++;
+            if (!sawInputEOS) {
+                if (seekOffsetFlag) {
+                    seekOffsetFlag = false;
+                    mAudioExtractor.seekTo(seekOffset, SEEK_TO_PREVIOUS_SYNC);
+                }
+
+                inputBufIndex = mAudioCodec.dequeueInputBuffer(TIMEOUT_USEC);
+
+                bufIndexCheck++;
+                //Log.e(LOG_TAG, " inputBufIndex " + inputBufIndex);
+                if (inputBufIndex >= 0) {
+                    ByteBuffer dstBuf = codecInputBuffers[inputBufIndex];
+
+                    int sampleSize =
+                            mAudioExtractor.readSampleData(dstBuf, 0 /* offset */);
+
+                    long presentationTimeUs = 0;
+
+                    if (sampleSize < 0) {
+                        sawInputEOS = true;
+                        sampleSize = 0;
+                    } else {
+                        presentationTimeUs = mAudioExtractor.getSampleTime();
+                    }
+                    curPosition = presentationTimeUs;
+                    mAudioCodec.queueInputBuffer(
+                            inputBufIndex,
+                            0 /* offset */,
+                            sampleSize,
+                            presentationTimeUs,
+                            sawInputEOS ? MediaCodec.BUFFER_FLAG_END_OF_STREAM : 0);
+
+
+                    if (!sawInputEOS) {
+                        mAudioExtractor.advance();
+                    }
+                } else {
+                    Log.e(TAG, "inputBufIndex " + inputBufIndex);
+                }
+            }
+
+            // decode to PCM and push it to the AudioTrack player
+            // 解码数据为PCM
+            int res = mAudioCodec.dequeueOutputBuffer(info, TIMEOUT_USEC);
+
+            if (res >= 0) {
+                if (info.size > 0) {
+                    noOutputCounter = 0;
+                }
+                int outputBufIndex = res;
+                ByteBuffer buf = codecOutputBuffers[outputBufIndex];
+
+                final byte[] chunk = new byte[info.size];
+                buf.get(chunk);
+                buf.clear();
+                if (chunk.length > 0 && audioTrack != null && !doStop) {
+                    //播放
+                    audioTrack.write(chunk, 0, chunk.length);
+                    hadPlay = true;
+                }
+                //释放
+                mAudioCodec.releaseOutputBuffer(outputBufIndex, false /* render */);
+                if ((info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
+                    sawOutputEOS = true;
+                }
+            } else if (res == MediaCodec.INFO_OUTPUT_BUFFERS_CHANGED) {
+                codecOutputBuffers = mAudioCodec.getOutputBuffers();
+            } else if (res == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                MediaFormat oformat = mAudioCodec.getOutputFormat();
+            } else {
+            }
+        }
+
+        relaxResources(true);
+
+        doStop = true;
+
+        if (sawOutputEOS) {
+            try {
+                if (isLoop || !hadPlay) {
+                    doAudio();
+                    return;
+                }
+            } catch (Exception e) {
+                // TODO Auto-generated catch block
+                e.printStackTrace();
+            }
+        }
+    }
+
+
+    /**
+     * AsyncTask that takes care of running the decode/playback loop
+     */
+    private class AudioPlayTask extends AsyncTask<Void, Void, Void> {
+
+        @Override
+        protected Void doInBackground(Void... values) {
+            doAudio();
+            return null;
+        }
+
+        @Override
+        protected void onPreExecute() {
+        }
+
+        @Override
+        protected void onProgressUpdate(Void... values) {
+        }
+    }
+
 
     private void doExtract(int frame) {
-        ByteBuffer inputBuffer;
+
         if (mMediaCodec == null) {
             return;
         }
-        int inputBufferIndex = mMediaCodec.dequeueInputBuffer(TIMEOUT_USEC);
+        int inputBufferIndex = 0;
+        try {
+            inputBufferIndex = mMediaCodec.dequeueInputBuffer(TIMEOUT_USEC);
+        } catch (Exception e) {
+            // TODO: 17-3-21 error after onResume,in none exxcuting state
+            return;
+        }
         if (inputBufferIndex >= 0) {
             if (Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP) {
-                // 从输入队列里去空闲buffer
+                // 从输入队列里去空闲outputBufferfer
                 inputBuffer = mMediaCodec.getInputBuffers()[inputBufferIndex];
-                inputBuffer.clear();
             } else {
                 // SDK_INT > LOLLIPOP
                 inputBuffer = mMediaCodec.getInputBuffer(inputBufferIndex);
@@ -298,6 +550,7 @@ public class FramePlayer implements Runnable {
                     mMediaExtractor.advance();
                 }
             }
+
             int outputBufferIndex = mMediaCodec.dequeueOutputBuffer(mBufferInfo, TIMEOUT_USEC);
             Log.d(TAG, outputBufferIndex + ":outputBufferIndex");
             if (outputBufferIndex >= 0) {

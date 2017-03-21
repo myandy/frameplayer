@@ -17,7 +17,7 @@ import java.io.File;
 public class MainActivity extends AppCompatActivity implements SurfaceHolder.Callback {
 
 
-    private static String videoPath = Environment.getExternalStorageDirectory().getPath() + "/two.mp4";
+    private static String videoPath = Environment.getExternalStorageDirectory().getPath() + "/test.mp4";
     private FramePlayer framePlayer = null;
 
 
@@ -69,6 +69,14 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
         });
     }
 
+    @Override
+    protected void onPause() {
+        super.onPause();
+        if (framePlayer != null) {
+            framePlayer.pause();
+        }
+
+    }
 
     @Override
     public void surfaceCreated(SurfaceHolder holder) {
