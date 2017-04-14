@@ -179,6 +179,9 @@ public class FramePlayer implements Runnable {
             timerTask = null;
             isRunning = false;
         }
+        if (mAudioPlayTask != null) {
+            mAudioPlayTask.cancel(true);
+        }
         doStop = true;
         seekOffset = 0;
         seekOffsetFlag = false;
@@ -275,7 +278,7 @@ public class FramePlayer implements Runnable {
                         AudioTrack.MODE_STREAM
                 );
 
-//开始play，等待write发出声音
+                //开始play，等待write发出声音
                 audioTrack.play();
                 mAudioExtractor.selectTrack(mAudioTrackIndex);
             }
@@ -290,9 +293,6 @@ public class FramePlayer implements Runnable {
             timerTask = new ProgressTimerTask();
             timer.schedule(timerTask, 0, mFrameInterval);
 
-            if (mAudioPlayTask != null) {
-                mAudioPlayTask.cancel(true);
-            }
             mAudioPlayTask = new AudioPlayTask();
             mAudioPlayTask.executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR);
 
@@ -386,7 +386,6 @@ public class FramePlayer implements Runnable {
         int noOutputCounterLimit = 50;
 
         int inputBufIndex;
-        int bufIndexCheck = 0;
         doStop = false;
         while (!sawOutputEOS && noOutputCounter < noOutputCounterLimit && !doStop) {
 
@@ -409,8 +408,6 @@ public class FramePlayer implements Runnable {
 
                 inputBufIndex = mAudioCodec.dequeueInputBuffer(TIMEOUT_USEC);
 
-                bufIndexCheck++;
-                //Log.e(LOG_TAG, " inputBufIndex " + inputBufIndex);
                 if (inputBufIndex >= 0) {
                     ByteBuffer dstBuf = codecInputBuffers[inputBufIndex];
 
@@ -485,7 +482,6 @@ public class FramePlayer implements Runnable {
                     return;
                 }
             } catch (Exception e) {
-                // TODO Auto-generated catch block
                 e.printStackTrace();
             }
         }
