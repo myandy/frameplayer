@@ -3,21 +3,30 @@ package com.myth.frameplayer;
 import android.os.Bundle;
 import android.os.Environment;
 import android.support.v7.app.AppCompatActivity;
+import android.util.DisplayMetrics;
 import android.util.Log;
 import android.view.Surface;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 import android.view.View;
 import android.widget.EditText;
+import android.widget.RelativeLayout;
 import android.widget.TextView;
 import android.widget.Toast;
 
 import java.io.File;
 
+
+/**
+ * warn:
+ * need get file read permission first
+ */
 public class MainActivity extends AppCompatActivity implements SurfaceHolder.Callback {
 
-
-    private static String videoPath = Environment.getExternalStorageDirectory().getPath() + "/test.mp4";
+    /**
+     * test video path
+     */
+    private static String videoPath = Environment.getExternalStorageDirectory().getPath() + "/Music8.1.mp4";
     private FramePlayer framePlayer = null;
 
 
@@ -27,6 +36,13 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
         setContentView(R.layout.activity_main);
         SurfaceView surfaceView = (SurfaceView) findViewById(R.id.playMovie_surface);
         surfaceView.getHolder().addCallback(this);
+
+        //make its height same with width,should set for video size
+        DisplayMetrics displayMetrics = getResources().getDisplayMetrics();
+        RelativeLayout.LayoutParams lps = (RelativeLayout.LayoutParams) surfaceView.getLayoutParams();
+        lps.width = (int) (displayMetrics.widthPixels - 2 * getResources().getDimension(R.dimen.activity_horizontal_margin));
+        lps.height = lps.width;
+        surfaceView.setLayoutParams(lps);
 
         final EditText et = (EditText) findViewById(R.id.et);
 
